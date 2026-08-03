@@ -387,8 +387,8 @@ def test_nondefault_policy_rejects_stale_or_legacy_results(monkeypatch, tmp_path
 # One backend serves every local profile, so ``projects.*`` takes an optional
 # ``params['profile']`` naming the profile the desktop is focused on. The
 # handler binds THAT profile's HERMES_HOME (projects.db, config) and state.db
-# for the duration of the call. Omitted/unknown profile → the launch profile,
-# exactly as before.
+# for the duration of the call. Omitted/blank profile → the launch profile;
+# an explicit unknown profile must fail closed.
 
 
 def _profile_dir(tmp_path: Path, name: str) -> Path:
@@ -602,7 +602,7 @@ def test_record_repos_writes_to_the_requested_profiles_projects_db(monkeypatch, 
 
 
 def test_projects_without_a_profile_stay_on_the_launch_home(monkeypatch, tmp_path):
-    """Omitted/blank/unknown profile is a no-op — the pre-scoping behavior."""
+    """Omitted or blank profile preserves the pre-scoping launch behavior."""
     launch_home = _profile_dir(tmp_path, "launch")
     coder_home = _profile_dir(tmp_path, "coder")
     repo = tmp_path / "repos" / "launch-only"
@@ -617,11 +617,9 @@ def test_projects_without_a_profile_stay_on_the_launch_home(monkeypatch, tmp_pat
 
         omitted = _call("projects.list")
         blank = _call("projects.list", {"profile": ""})
-        unknown = _call("projects.list", {"profile": "not-a-profile"})
 
     assert [p["name"] for p in omitted["projects"]] == ["Launch only"]
     assert blank == omitted
-    assert unknown == omitted
     assert omitted["active_id"] == created["id"]
 
     # Everything landed in the launch home — never in another profile, and never
@@ -629,3 +627,15 @@ def test_projects_without_a_profile_stay_on_the_launch_home(monkeypatch, tmp_pat
     assert _cached_repo_labels(launch_home) == ["only"]
     assert not (coder_home / "projects.db").exists()
     assert not (Path(os.environ["HERMES_HOME"]) / "projects.db").exists()
+
+
+def test_projects_reject_an_explicit_unknown_profile(monkeypatch, tmp_path):
+    """A misspelled/deleted profile must never expose the launch profile's data."""
+    launch_home = _profile_dir(tmp_path, "launch")
+    _bind_profiles(monkeypatch, tmp_path, {"default": launch_home})
+
+    with _serving_launch_profile(launch_home):
+        resp = server._methods["projects.list"](1, {"profile": "not-a-profile"})
+
+    assert "error" in resp
+    assert "unknown profile" in resp["error"]["message"].lower()

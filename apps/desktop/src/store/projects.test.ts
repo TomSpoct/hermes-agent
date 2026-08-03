@@ -21,6 +21,7 @@ import {
   endSessionMutation,
   enterProject,
   exitProjectScope,
+  fetchProjectSessions,
   openProjectCreate,
   pickProjectFolder,
   projectNameForCwd,
@@ -30,7 +31,7 @@ import {
   resolveNewSessionCwd,
   scanAndRecordRepos,
   tombstoneSessions,
-  fetchProjectSessions
+  updateProject
 } from './projects'
 
 const projectScopeStorage = new Map<string, string>()
@@ -82,6 +83,7 @@ const selectDesktopPaths = vi.mocked(fs.selectDesktopPaths)
 
 const gw = await import('@/store/gateway')
 const activeGateway = vi.mocked(gw.activeGateway)
+const ensureActiveGatewayOpen = vi.mocked(gw.ensureActiveGatewayOpen)
 const gatewayAtom = gw.$gateway
 
 const git = await import('@/lib/desktop-git')
@@ -520,6 +522,50 @@ describe('repository discovery policy', () => {
     // And the completion tree refresh must not publish under the new profile.
     expect($projectTree.get()).toEqual([])
   })
+
+  it('keeps same-gateway scan state independent for each profile', async () => {
+    const { promise: launchScan, resolve: resolveLaunch } = deferred<Array<{ label: string; root: string }>>()
+    const request = vi.fn(async (method: string) =>
+      method === 'projects.tree'
+        ? { active_id: null, projects: [], scoped_session_ids: [] }
+        : { accepted: true, repos: [] }
+    )
+
+    gatewayWith(request)
+    const scanRepos = vi
+      .fn()
+      .mockImplementationOnce(() => launchScan)
+      .mockResolvedValueOnce([{ label: 'coder-repo', root: '/work/coder' }])
+    desktopGit.mockReturnValue({ scanRepos } as never)
+    getHermesConfig.mockResolvedValue({
+      desktop: {
+        repo_scan_enabled: true,
+        repo_scan_exclude_paths: [],
+        repo_scan_roots: ['/work']
+      }
+    })
+
+    $activeGatewayProfile.set('launch')
+    const pendingLaunch = scanAndRecordRepos()
+    await vi.waitFor(() => expect(scanRepos).toHaveBeenCalledTimes(1))
+
+    $activeGatewayProfile.set('coder')
+    const pendingCoder = scanAndRecordRepos()
+    resolveLaunch([{ label: 'launch-repo', root: '/work/launch' }])
+    await Promise.all([pendingLaunch, pendingCoder])
+
+    expect(scanRepos).toHaveBeenCalledTimes(2)
+    expect(request).toHaveBeenCalledWith('projects.record_repos', {
+      discovery_policy: { enabled: true, exclude_paths: [], roots: ['/work'] },
+      profile: 'launch',
+      repos: [{ label: 'launch-repo', root: '/work/launch' }]
+    })
+    expect(request).toHaveBeenCalledWith('projects.record_repos', {
+      discovery_policy: { enabled: true, exclude_paths: [], roots: ['/work'] },
+      profile: 'coder',
+      repos: [{ label: 'coder-repo', root: '/work/coder' }]
+    })
+  })
 })
 
 describe('project profile isolation', () => {
@@ -606,6 +652,60 @@ describe('project profile isolation', () => {
 
     expect(profileB?.id).toBe('profile-b')
     await expect(pendingDefault).resolves.toBeNull()
+  })
+
+  it('does not restore a previous-profile snapshot when an optimistic write fails late', async () => {
+    let rejectDefault!: (reason?: unknown) => void
+    const defaultResponse = new Promise<never>((_resolve, reject) => {
+      rejectDefault = reject
+    })
+    const request = vi.fn(() => defaultResponse)
+    const gateway = { connectionState: 'open', request }
+    activeGateway.mockReturnValue(gateway as never)
+    gatewayAtom.set(gateway as never)
+    $activeGatewayProfile.set('default')
+    $projects.set([{ folders: [], id: 'profile-a', name: 'Profile A', primary_path: '/work/a' } as never])
+    $projectTree.set([
+      { id: 'profile-a', label: 'Profile A', path: '/work/a', repos: [], sessionCount: 0 }
+    ])
+
+    const pendingDefault = updateProject('profile-a', { name: 'Profile A renamed' })
+    await vi.waitFor(() => expect(request).toHaveBeenCalledTimes(1))
+    $activeGatewayProfile.set('profile-b')
+    $projects.set([{ folders: [], id: 'profile-b', name: 'Profile B', primary_path: '/work/b' } as never])
+    $projectTree.set([
+      { id: 'profile-b', label: 'Profile B', path: '/work/b', repos: [], sessionCount: 0 }
+    ])
+    rejectDefault(new Error('default-profile write failed'))
+
+    await expect(pendingDefault).rejects.toThrow('default-profile write failed')
+    expect($projects.get().map(project => project.id)).toEqual(['profile-b'])
+    expect($projectTree.get().map(project => project.id)).toEqual(['profile-b'])
+  })
+
+  it('does not send a mutation when the profile changes while reconnecting', async () => {
+    const { promise: connected, resolve: resolveConnected } = deferred<{
+      connectionState: string
+      request: ReturnType<typeof vi.fn>
+    }>()
+
+    const request = vi.fn().mockResolvedValue(undefined)
+    const gateway = { connectionState: 'open', request }
+    let currentGateway: typeof gateway | null = null
+
+    activeGateway.mockImplementation(() => currentGateway as never)
+    ensureActiveGatewayOpen.mockReturnValue(connected as never)
+    $activeGatewayProfile.set('default')
+
+    const pendingDefault = updateProject('profile-a', { name: 'Profile A renamed' })
+    await vi.waitFor(() => expect(ensureActiveGatewayOpen).toHaveBeenCalledTimes(1))
+
+    $activeGatewayProfile.set('profile-b')
+    currentGateway = gateway
+    resolveConnected(gateway)
+
+    await expect(pendingDefault).rejects.toThrow('Active Hermes profile changed while connecting')
+    expect(request).not.toHaveBeenCalled()
   })
 })
 

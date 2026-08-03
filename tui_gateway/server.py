@@ -1230,6 +1230,19 @@ def _profile_home(profile: str | None) -> Path | None:
     return home if (home / "state.db").exists() or home.exists() else None
 
 
+def _is_launch_profile_request(profile: str | None) -> bool:
+    """Whether an omitted or explicit profile resolves to this process's home."""
+    name = (profile or "").strip()
+    if not name:
+        return True
+    try:
+        from hermes_cli import profiles as profiles_mod
+
+        return Path(profiles_mod.get_profile_dir(name)).resolve() == Path(_hermes_home).resolve()
+    except Exception:
+        return False
+
+
 def _profile_scoped(handler):
     """Bind ``params['profile']``'s HERMES_HOME around a pet RPC handler.
 
@@ -1262,8 +1275,11 @@ def _projects_profile_home(params: dict | None):
     profile — must bind the focused profile's home around the whole handler, not
     just its session-db read. No-op for the launch profile.
     """
-    home = _profile_home(params.get("profile") if isinstance(params, dict) else None)
+    requested = params.get("profile") if isinstance(params, dict) else None
+    home = _profile_home(requested)
     if home is None:
+        if not _is_launch_profile_request(requested):
+            raise ValueError(f"unknown profile: {str(requested).strip()}")
         yield None
         return
     token = set_hermes_home_override(home)

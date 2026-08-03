@@ -361,6 +361,10 @@ interface ActiveProjectsContext {
   profile: string
 }
 
+function isActiveProjectsContext(context: ActiveProjectsContext): boolean {
+  return activeGateway() === context.gateway && projectProfile() === context.profile
+}
+
 async function activeProjectsContext(): Promise<ActiveProjectsContext> {
   const profile = projectProfile()
 
@@ -573,15 +577,19 @@ interface RepoScanState {
   runningSignature?: string
 }
 
-const repoScanStates = new WeakMap<HermesGateway, RepoScanState>()
-const scanningGatewayGenerations = new WeakMap<HermesGateway, number>()
+const repoScanStates = new WeakMap<HermesGateway, Map<string, RepoScanState>>()
+const scanningGatewayGenerations = new WeakMap<HermesGateway, Map<string, number>>()
 
 function syncReposScanning(): void {
   const gateway = activeGateway()
-  $reposScanning.set(Boolean(gateway && scanningGatewayGenerations.has(gateway)))
+  const profile = projectProfile()
+  const generations = gateway ? scanningGatewayGenerations.get(gateway) : undefined
+
+  $reposScanning.set(Boolean(profile && generations?.has(profile)))
 }
 
 $gateway.subscribe(syncReposScanning)
+$activeGatewayProfile.subscribe(syncReposScanning)
 
 export async function scanAndRecordRepos(force = false): Promise<void> {
   if (isDesktopFsRemoteMode()) {
@@ -602,8 +610,15 @@ export async function scanAndRecordRepos(force = false): Promise<void> {
     return
   }
 
-  const state = repoScanStates.get(context.gateway) ?? { generation: 0 }
-  repoScanStates.set(context.gateway, state)
+  let states = repoScanStates.get(context.gateway)
+
+  if (!states) {
+    states = new Map()
+    repoScanStates.set(context.gateway, states)
+  }
+
+  const state = states.get(context.profile) ?? { generation: 0 }
+  states.set(context.profile, state)
   let generation: number | undefined
 
   try {
@@ -630,7 +645,14 @@ export async function scanAndRecordRepos(force = false): Promise<void> {
         )
       )
     } else {
-      scanningGatewayGenerations.set(context.gateway, generation)
+      let generations = scanningGatewayGenerations.get(context.gateway)
+
+      if (!generations) {
+        generations = new Map()
+        scanningGatewayGenerations.set(context.gateway, generations)
+      }
+
+      generations.set(context.profile, generation)
       syncReposScanning()
 
       const repos = await scan(policy.roots, {
@@ -674,8 +696,14 @@ export async function scanAndRecordRepos(force = false): Promise<void> {
   } finally {
     state.runningSignature = undefined
 
-    if (scanningGatewayGenerations.get(context.gateway) === generation) {
-      scanningGatewayGenerations.delete(context.gateway)
+    const generations = scanningGatewayGenerations.get(context.gateway)
+
+    if (generations && generations.get(context.profile) === generation) {
+      generations.delete(context.profile)
+
+      if (!generations.size) {
+        scanningGatewayGenerations.delete(context.gateway)
+      }
     }
 
     syncReposScanning()
@@ -756,12 +784,19 @@ const restoreProjects = ({ projects, tree, active }: ProjectsSnapshot): void => 
   $activeProjectId.set(active)
 }
 
-// Await an already-applied optimistic write; restore the snapshot if it throws.
-async function persistOrRollback(snap: ProjectsSnapshot, write: () => Promise<void>): Promise<void> {
+// Await an already-applied optimistic write; restore the snapshot if it throws
+// while the originating gateway/profile is still active.
+async function persistOrRollback(
+  context: ActiveProjectsContext,
+  snap: ProjectsSnapshot,
+  write: () => Promise<void>
+): Promise<void> {
   try {
     await write()
   } catch (err) {
-    restoreProjects(snap)
+    if (isActiveProjectsContext(context)) {
+      restoreProjects(snap)
+    }
     throw err
   }
 }
@@ -793,22 +828,27 @@ export async function createProject(input: CreateProjectInput): Promise<ProjectI
     throw projectsStaleBackendError()
   }
 
+  const context = await activeProjectsContext()
   let res: { project: ProjectInfo | null }
 
   try {
-    res = await gatewayRequest<{ project: ProjectInfo | null }>(
+    res = await gatewayRequestOn<{ project: ProjectInfo | null }>(
+      context.gateway,
       'projects.create',
-      projectParams({
-        name: input.name,
-        folders: input.folders ?? [],
-        primary_path: input.primaryPath,
-        slug: input.slug,
-        description: input.description,
-        icon: input.icon,
-        color: input.color,
-        board_slug: input.boardSlug,
-        use: input.use ?? false
-      })
+      projectParams(
+        {
+          name: input.name,
+          folders: input.folders ?? [],
+          primary_path: input.primaryPath,
+          slug: input.slug,
+          description: input.description,
+          icon: input.icon,
+          color: input.color,
+          board_slug: input.boardSlug,
+          use: input.use ?? false
+        },
+        context.profile
+      )
     )
   } catch (err) {
     if (isMissingRpcMethod(err)) {
@@ -832,6 +872,10 @@ export async function createProject(input: CreateProjectInput): Promise<ProjectI
       void writeProjectIdea(created.primary_path ?? created.folders?.[0]?.path ?? input.primaryPath, input.idea)
     }
 
+    if (!isActiveProjectsContext(context)) {
+      return created
+    }
+
     if (!$projects.get().some(proj => proj.id === created.id)) {
       $projects.set([...$projects.get(), created])
     }
@@ -847,7 +891,9 @@ export async function createProject(input: CreateProjectInput): Promise<ProjectI
     setSidebarAgentsGrouped(true)
   }
 
-  reconcileProjects()
+  if (isActiveProjectsContext(context)) {
+    reconcileProjects()
+  }
 
   return created
 }
@@ -863,6 +909,7 @@ export async function updateProject(
   id: string,
   patch: { name?: string; color?: null | string; icon?: null | string }
 ): Promise<void> {
+  const context = await activeProjectsContext()
   const snap = snapshotProjects()
 
   $projectTree.set(
@@ -881,15 +928,19 @@ export async function updateProject(
 
   // Backend treats null/undefined as "leave unchanged"; "" clears (stores NULL).
   // Map explicit null → "" so "no color"/"no icon" actually clear.
-  await persistOrRollback(snap, () =>
-    gatewayRequest(
+  await persistOrRollback(context, snap, () =>
+    gatewayRequestOn(
+      context.gateway,
       'projects.update',
-      projectParams({
-        id,
-        ...patch,
-        ...(patch.color === null && { color: '' }),
-        ...(patch.icon === null && { icon: '' })
-      })
+      projectParams(
+        {
+          id,
+          ...patch,
+          ...(patch.color === null && { color: '' }),
+          ...(patch.icon === null && { icon: '' })
+        },
+        context.profile
+      )
     )
   )
 }
@@ -931,6 +982,7 @@ export async function addProjectFolder(
   path: string,
   opts: { label?: string; isPrimary?: boolean } = {}
 ): Promise<void> {
+  const context = await activeProjectsContext()
   const snap = snapshotProjects()
   const trimmed = path.trim()
 
@@ -960,13 +1012,17 @@ export async function addProjectFolder(
     }
   }
 
-  await persistOrRollback(snap, () =>
-    gatewayRequest(
+  await persistOrRollback(context, snap, () =>
+    gatewayRequestOn(
+      context.gateway,
       'projects.add_folder',
-      projectParams({ id, path, label: opts.label, is_primary: opts.isPrimary ?? false })
+      projectParams({ id, path, label: opts.label, is_primary: opts.isPrimary ?? false }, context.profile)
     )
   )
-  reconcileProjects()
+
+  if (isActiveProjectsContext(context)) {
+    reconcileProjects()
+  }
 }
 
 // True when the session currently open in the main pane belongs to `projectId`.
@@ -988,6 +1044,7 @@ function openSessionBelongsToProject(projectId: string, projects: ProjectInfo[])
 // clicked (the entered-scope effect exits if you deleted the project you were
 // inside), reconciling from the server payload. A failed delete restores both.
 export async function deleteProject(id: string): Promise<void> {
+  const context = await activeProjectsContext()
   const snap = snapshotProjects()
   // Capture membership BEFORE removal — the project's folders (which determine
   // ownership) are gone once it's dropped from the cache.
@@ -1006,15 +1063,34 @@ export async function deleteProject(id: string): Promise<void> {
     requestFreshSession()
   }
 
-  await persistOrRollback(snap, async () => {
-    applyPayload(await gatewayRequest<ProjectsPayload>('projects.delete', projectParams({ id })))
+  await persistOrRollback(context, snap, async () => {
+    const payload = await gatewayRequestOn<ProjectsPayload>(
+      context.gateway,
+      'projects.delete',
+      projectParams({ id }, context.profile)
+    )
+
+    if (isActiveProjectsContext(context)) {
+      applyPayload(payload)
+    }
   })
-  void refreshProjectTree()
+
+  if (isActiveProjectsContext(context)) {
+    void refreshProjectTree()
+  }
 }
 
 export async function setActiveProject(id: null | string): Promise<void> {
-  const res = await gatewayRequest<{ active_id: null | string }>('projects.set_active', projectParams({ id }))
-  $activeProjectId.set(res.active_id ?? null)
+  const context = await activeProjectsContext()
+  const res = await gatewayRequestOn<{ active_id: null | string }>(
+    context.gateway,
+    'projects.set_active',
+    projectParams({ id }, context.profile)
+  )
+
+  if (isActiveProjectsContext(context)) {
+    $activeProjectId.set(res.active_id ?? null)
+  }
 }
 
 // ── Project management dialog ────────────────────────────────────────────────
