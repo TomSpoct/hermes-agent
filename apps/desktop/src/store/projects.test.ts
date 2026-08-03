@@ -30,6 +30,7 @@ import {
   refreshWorktrees,
   resolveNewSessionCwd,
   scanAndRecordRepos,
+  setActiveProject,
   tombstoneSessions,
   updateProject
 } from './projects'
@@ -706,6 +707,27 @@ describe('project profile isolation', () => {
 
     await expect(pendingDefault).rejects.toThrow('Active Hermes profile changed while connecting')
     expect(request).not.toHaveBeenCalled()
+  })
+
+  it('does not apply a late set-active response from the previous profile', async () => {
+    const { promise: defaultResponse, resolve: resolveDefault } = deferred<{ active_id: string }>()
+    const request = vi.fn(() => defaultResponse)
+    const gateway = { connectionState: 'open', request }
+
+    activeGateway.mockReturnValue(gateway as never)
+    gatewayAtom.set(gateway as never)
+    $activeGatewayProfile.set('default')
+    $activeProjectId.set('default-project')
+
+    const pendingDefault = setActiveProject('default-next')
+    await vi.waitFor(() => expect(request).toHaveBeenCalledTimes(1))
+
+    $activeGatewayProfile.set('profile-b')
+    $activeProjectId.set('profile-b-project')
+    resolveDefault({ active_id: 'default-next' })
+    await pendingDefault
+
+    expect($activeProjectId.get()).toBe('profile-b-project')
   })
 })
 
