@@ -3146,9 +3146,7 @@ DEFAULT_CONFIG = {
     "desktop": {
         # Git repository discovery for the Desktop Projects sidebar. Empty
         # roots preserve the historical bounded scan of the user's home.
-        # Default off: repos are backup-only on this host; git lanes in the
-        # sidebar are noise. Flip to True per-profile if you want them back.
-        "repo_scan_enabled": False,
+        "repo_scan_enabled": True,
         "repo_scan_roots": [],
         "repo_scan_exclude_paths": [],
         # Extra Electron command-line flags appended to every desktop launch,
